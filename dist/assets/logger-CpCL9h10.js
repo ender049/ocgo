@@ -1,0 +1,1 @@
+var e=(...e)=>{},t={log:e,debug:e,warn:console.warn.bind(console),error:console.error.bind(console)};export{t};

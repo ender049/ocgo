@@ -1,18 +1,115 @@
-name: Release
+name: Sync And Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  schedule:
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
+concurrency:
+  group: sync-and-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: lehhair/OpenCodeUI
+
 jobs:
-  release:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Get latest upstream version
+        id: version
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest | jq -r '.tag_name')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if already released here
+        id: check
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.version.outputs.version }}")
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+  prepare:
+    needs: check
+    if: needs.check.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.upstream.outputs.body }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Clone upstream
+        run: |
+          git clone --branch ${{ needs.check.outputs.version }} https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
+
+      - name: Build upstream frontend
+        run: |
+          cd upstream
+          npm ci
+          npm run build
+        env:
+          VITE_API_BASE_URL: /api
+
+      - name: Pack frontend dist
+        run: |
+          tar -czf frontend-dist.tar.gz -C upstream dist
+
+      - name: Get upstream release notes
+        id: upstream
+        run: |
+          BODY=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/tags/${{ needs.check.outputs.version }} | jq -r '.body // empty')
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "Synced from ${{ env.UPSTREAM_REPO }} ${{ needs.check.outputs.version }}" >> $GITHUB_OUTPUT
+          echo >> $GITHUB_OUTPUT
+          echo "$BODY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist.tar.gz
+
+  build:
+    needs: [check, prepare]
+    if: needs.check.outputs.exists == 'false'
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        goos: [linux, darwin, windows]
-        goarch: [amd64, arm64]
-    runs-on: ubuntu-latest
+        include:
+          - goos: linux
+            goarch: amd64
+            asset: opencodeui-linux-amd64
+          - goos: linux
+            goarch: arm64
+            asset: opencodeui-linux-arm64
+          - goos: darwin
+            goarch: amd64
+            asset: opencodeui-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            asset: opencodeui-darwin-arm64
+          - goos: windows
+            goarch: amd64
+            asset: opencodeui-windows-amd64.exe
+          - goos: windows
+            goarch: arm64
+            asset: opencodeui-windows-arm64.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -20,19 +117,47 @@ jobs:
         with:
           go-version: '1.21'
 
-      - name: Build
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+
+      - name: Unpack frontend dist
+        run: |
+          rm -rf dist
+          tar -xzf frontend-dist.tar.gz
+
+      - name: Build tool
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          EXT=""
-          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
-          NAME="opencodeui-${GOOS}-${GOARCH}${EXT}"
-          go build -ldflags="-s -w" -o "$NAME" .
+          go build -ldflags="-s -w -X main.toolVersion=${{ needs.check.outputs.version }}" -o "${{ matrix.asset }}" .
 
-      - name: Upload
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: [check, prepare, build]
+    if: needs.check.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: opencodeui-*
+          tag_name: ${{ needs.check.outputs.version }}
+          name: OpenCodeUI ${{ needs.check.outputs.version }}
+          body: ${{ needs.prepare.outputs.notes }}
+          files: release-assets/*
+          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
