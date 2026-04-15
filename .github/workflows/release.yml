@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release:
+    strategy:
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
+          NAME="opencodeui-${GOOS}-${GOARCH}${EXT}"
+          go build -ldflags="-s -w" -o "$NAME" .
+
+      - name: Upload
+        uses: softprops/action-gh-release@v2
+        with:
+          files: opencodeui-*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

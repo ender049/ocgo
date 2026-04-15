@@ -1,0 +1,85 @@
+name: Sync Frontend
+
+on:
+  schedule:
+    # 每6小时检查一次
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: lehhair/OpenCodeUI
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Get latest version
+        id: version
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest | jq -r '.tag_name')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Latest upstream version: $VERSION"
+
+      - name: Check if release exists
+        id: check
+        run: |
+          EXISTS=false
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.version.outputs.version }}")
+          
+          if [[ "$HTTP_CODE" == "200" ]]; then
+            EXISTS=true
+            echo "Release ${{ steps.version.outputs.version }} already exists"
+          fi
+          echo "exists=$EXISTS" >> $GITHUB_OUTPUT
+
+  sync:
+    needs: check
+    if: needs.check.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Clone upstream
+        run: |
+          git clone --depth 1 --branch ${{ needs.check.outputs.version }} \
+            https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
+
+      - name: Install
+        working-directory: upstream
+        run: npm ci
+
+      - name: Build
+        working-directory: upstream
+        run: npm run build
+        env:
+          VITE_API_BASE_URL: /api
+
+      - name: Package
+        run: |
+          tar -czf opencodeui-dist.tar.gz -C upstream/dist .
+          echo "dist.tar.gz created"
+
+      - name: Create Release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.version }}
+          name: Sync ${{ needs.check.outputs.version }}
+          generate_release_notes: true
+          files: opencodeui-dist.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show result
+        run: |
+          echo "Created release: ${{ steps.release.outputs.url }}"
