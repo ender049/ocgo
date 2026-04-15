@@ -54,12 +54,14 @@ jobs:
             https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
 
       - name: Install
-        working-directory: upstream
-        run: npm install --legacy-peer-deps
+        run: |
+          cd upstream
+          npm ci
 
       - name: Build
-        working-directory: upstream
-        run: npx vite build
+        run: |
+          cd upstream
+          npx vite build
         env:
           VITE_API_BASE_URL: /api
 
