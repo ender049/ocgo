@@ -119,15 +119,32 @@ func runUpdate(_ *cobra.Command, _ []string) error {
 	}
 	stopCheck()
 
+	stopDownload := startSpinner("Downloading update")
+	selfPath, err := os.Executable()
+	if err != nil {
+		stopDownload()
+		return err
+	}
+
+	tmpPath := selfPath + ".new"
+	if err := downloadReleaseAssetToFile(remote, toolAssetName(), tmpPath); err != nil {
+		stopDownload()
+		return err
+	}
+	stopDownload()
+
 	if runningState != nil {
 		ok, err := confirmStopForUpdate(runningState.PID)
 		if err != nil {
+			_ = os.Remove(tmpPath)
 			return err
 		}
 		if !ok {
+			_ = os.Remove(tmpPath)
 			return fmt.Errorf("update cancelled")
 		}
 		if err := stopProcess(runningState.PID); err != nil {
+			_ = os.Remove(tmpPath)
 			return fmt.Errorf("failed to stop running server: %w", err)
 		}
 		_ = os.Remove(pidFile)
@@ -135,37 +152,7 @@ func runUpdate(_ *cobra.Command, _ []string) error {
 		fmt.Println("Server stopped")
 	}
 
-	stopDownload := startSpinner("Downloading update")
-	resp, sourceURL, err := downloadReleaseAsset(remote, toolAssetName())
-	if err != nil {
-		stopDownload()
-		return err
-	}
-	defer resp.Body.Close()
-	stopDownload()
-	fmt.Printf("Downloading from %s\n", sourceURL)
-
-	selfPath, err := os.Executable()
-	if err != nil {
-		return err
-	}
-
-	tmpPath := selfPath + ".new"
 	backupPath := selfPath + ".bak"
-
-	out, err := os.Create(tmpPath)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		out.Close()
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	if err := out.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
 	if runtime.GOOS != "windows" {
 		_ = os.Chmod(tmpPath, 0755)
 	}
@@ -192,6 +179,30 @@ func runUpdate(_ *cobra.Command, _ []string) error {
 		fmt.Printf("Server restarted on %s:%d\n", runningState.ListenIP, runningState.Port)
 	}
 
+	return nil
+}
+
+func downloadReleaseAssetToFile(version, asset, targetPath string) error {
+	resp, sourceURL, err := downloadReleaseAsset(version, asset)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	fmt.Printf("Downloading from %s\n", sourceURL)
+
+	out, err := os.Create(targetPath)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		out.Close()
+		_ = os.Remove(targetPath)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(targetPath)
+		return err
+	}
 	return nil
 }
 
