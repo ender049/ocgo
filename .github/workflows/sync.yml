@@ -47,7 +47,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
 
       - name: Clone upstream
         run: |
@@ -56,7 +55,7 @@ jobs:
 
       - name: Install
         working-directory: upstream
-        run: npm ci
+        run: npm install --legacy-peer-deps
 
       - name: Build
         working-directory: upstream
