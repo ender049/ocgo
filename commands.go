@@ -197,6 +197,16 @@ func releaseAssetURLs(version, asset string) []string {
 	}
 }
 
+func latestReleaseInfoURLs(owner, repo string) []string {
+	base := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", owner, repo)
+	return []string{
+		base,
+		"https://gh-proxy.com/" + base,
+		"https://mirror.ghproxy.com/" + base,
+		"https://ghproxy.net/" + base,
+	}
+}
+
 func toolAssetName() string {
 	name := fmt.Sprintf("opencodeui-%s-%s", runtime.GOOS, runtime.GOARCH)
 	if runtime.GOOS == "windows" {
@@ -206,32 +216,44 @@ func toolAssetName() string {
 }
 
 func getLatestReleaseTag(owner, repo string) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", owner, repo), nil)
-	if err != nil {
-		return "", err
-	}
-
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
+	var errs []string
 
-	if resp.StatusCode == http.StatusNotFound {
-		return "", nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	for _, url := range latestReleaseInfoURLs(owner, repo) {
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return "", err
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", url, err))
+			continue
+		}
+
+		if resp.StatusCode == http.StatusNotFound {
+			_ = resp.Body.Close()
+			return "", nil
+		}
+		if resp.StatusCode != http.StatusOK {
+			errs = append(errs, fmt.Sprintf("%s: HTTP %d", url, resp.StatusCode))
+			_ = resp.Body.Close()
+			continue
+		}
+
+		var payload struct {
+			TagName string `json:"tag_name"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			_ = resp.Body.Close()
+			errs = append(errs, fmt.Sprintf("%s: %v", url, err))
+			continue
+		}
+		_ = resp.Body.Close()
+		return payload.TagName, nil
 	}
 
-	var payload struct {
-		TagName string `json:"tag_name"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", err
-	}
-	return payload.TagName, nil
+	return "", fmt.Errorf("failed to query latest release, tried all mirrors: %s", strings.Join(errs, " | "))
 }
 
 var startCmd = &cobra.Command{
