@@ -2,5 +2,4 @@ opencodeui
 .version
 .opencodeui.pid
 .opencodeui.state.json
-.opencodeui.log
-cmd/httpcheck/
+opencodeui-linux-amd64

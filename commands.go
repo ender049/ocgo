@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"os"
@@ -25,7 +26,6 @@ const (
 	repoName    = "opencodeui"
 	pidFile     = ".opencodeui.pid"
 	stateFile   = ".opencodeui.state.json"
-	logFile     = ".opencodeui.log"
 	frontendDir = "dist"
 )
 
@@ -394,7 +394,6 @@ func runStart(_ *cobra.Command, _ []string) error {
 	fmt.Printf("  PID:     %d\n", pid)
 	fmt.Printf("  Listen:  %s:%d\n", state.ListenIP, state.Port)
 	fmt.Printf("  Backend: %s\n", state.Backend)
-	fmt.Printf("  Log:     %s\n", logFile)
 	return nil
 }
 
@@ -402,18 +401,20 @@ func startDetached(selfPath string, state *serverState) (int, error) {
 	if state == nil {
 		return 0, fmt.Errorf("missing server state")
 	}
-
-	logHandle, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return 0, fmt.Errorf("failed to open log file: %w", err)
+	if err := ensureListenAddressAvailable(state.ListenIP, state.Port); err != nil {
+		return 0, err
 	}
-	defer logHandle.Close()
 
 	nullHandle, err := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
 	if err != nil {
 		return 0, fmt.Errorf("failed to open devnull: %w", err)
 	}
 	defer nullHandle.Close()
+	nullWriteHandle, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open devnull: %w", err)
+	}
+	defer nullWriteHandle.Close()
 
 	cmd := exec.Command(selfPath, "serve",
 		"--backend", state.Backend,
@@ -421,8 +422,8 @@ func startDetached(selfPath string, state *serverState) (int, error) {
 		"--port", fmt.Sprintf("%d", state.Port),
 	)
 	cmd.Stdin = nullHandle
-	cmd.Stdout = logHandle
-	cmd.Stderr = logHandle
+	cmd.Stdout = nullWriteHandle
+	cmd.Stderr = nullWriteHandle
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {
@@ -441,7 +442,7 @@ func startDetached(selfPath string, state *serverState) (int, error) {
 	if !isProcessRunning(pid) {
 		_ = os.Remove(pidFile)
 		_ = os.Remove(stateFile)
-		return 0, fmt.Errorf("server exited immediately, check %s", logFile)
+		return 0, fmt.Errorf("server exited immediately")
 	}
 
 	return pid, nil
@@ -486,8 +487,16 @@ func runStatus(_ *cobra.Command, _ []string) error {
 	if err == nil {
 		fmt.Printf("Listen:  %s:%d\n", state.ListenIP, state.Port)
 		fmt.Printf("Backend: %s\n", state.Backend)
-		fmt.Printf("Log:     %s\n", logFile)
 	}
+	return nil
+}
+
+func ensureListenAddressAvailable(ip string, port int) error {
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", ip, port))
+	if err != nil {
+		return fmt.Errorf("listen %s:%d unavailable: %w", ip, port, err)
+	}
+	_ = ln.Close()
 	return nil
 }
 
