@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -83,7 +84,17 @@ var updateCmd = &cobra.Command{
 
 func runUpdate(_ *cobra.Command, _ []string) error {
 	if pid, _ := readPID(); pid > 0 && isProcessRunning(pid) {
-		return fmt.Errorf("server is running (PID %d), stop it before updating", pid)
+		ok, err := confirmStopForUpdate(pid)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("update cancelled")
+		}
+		if err := stopProcess(pid); err != nil {
+			return fmt.Errorf("failed to stop running server: %w", err)
+		}
+		fmt.Println("Server stopped")
 	}
 
 	remote, err := getLatestReleaseTag(repoOwner, repoName)
@@ -98,17 +109,12 @@ func runUpdate(_ *cobra.Command, _ []string) error {
 		return nil
 	}
 
-	url := fmt.Sprintf("https://github.com/%s/%s/releases/download/%s/%s", repoOwner, repoName, remote, toolAssetName())
-	client := &http.Client{Timeout: 10 * time.Minute}
-	resp, err := client.Get(url)
+	resp, sourceURL, err := downloadReleaseAsset(remote, toolAssetName())
 	if err != nil {
-		return fmt.Errorf("download failed: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
-	}
+	fmt.Printf("Downloading from %s\n", sourceURL)
 
 	selfPath, err := os.Executable()
 	if err != nil {
@@ -147,6 +153,48 @@ func runUpdate(_ *cobra.Command, _ []string) error {
 
 	fmt.Printf("Updated to %s ✓\n", remote)
 	return nil
+}
+
+func confirmStopForUpdate(pid int) (bool, error) {
+	fmt.Printf("Server is running (PID %d). Stop it and continue update? [y/N]: ", pid)
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return false, err
+	}
+	answer := strings.TrimSpace(strings.ToLower(input))
+	return answer == "y" || answer == "yes", nil
+}
+
+func downloadReleaseAsset(version, asset string) (*http.Response, string, error) {
+	urls := releaseAssetURLs(version, asset)
+	client := &http.Client{Timeout: 10 * time.Minute}
+	var errs []string
+
+	for _, url := range urls {
+		resp, err := client.Get(url)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", url, err))
+			continue
+		}
+		if resp.StatusCode == http.StatusOK {
+			return resp, url, nil
+		}
+		_ = resp.Body.Close()
+		errs = append(errs, fmt.Sprintf("%s: HTTP %d", url, resp.StatusCode))
+	}
+
+	return nil, "", fmt.Errorf("download failed, tried all mirrors: %s", strings.Join(errs, " | "))
+}
+
+func releaseAssetURLs(version, asset string) []string {
+	base := fmt.Sprintf("https://github.com/%s/%s/releases/download/%s/%s", repoOwner, repoName, version, asset)
+	return []string{
+		base,
+		"https://gh-proxy.com/" + base,
+		"https://mirror.ghproxy.com/" + base,
+		"https://ghproxy.net/" + base,
+	}
 }
 
 func toolAssetName() string {
@@ -299,7 +347,7 @@ func runStop(_ *cobra.Command, _ []string) error {
 		fmt.Println("Server not running (stale pid file)")
 		return nil
 	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+	if err := stopProcess(pid); err != nil {
 		return fmt.Errorf("failed to stop: %w", err)
 	}
 	_ = os.Remove(pidFile)
@@ -368,6 +416,22 @@ func isProcessRunning(pid int) bool {
 		return false
 	}
 	return syscall.Kill(pid, 0) == nil
+}
+
+func stopProcess(pid int) error {
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		return err
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !isProcessRunning(pid) {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	return fmt.Errorf("process %d did not exit in time", pid)
 }
 
 func runServe(_ *cobra.Command, _ []string) {

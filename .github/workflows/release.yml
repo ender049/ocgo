@@ -138,7 +138,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          go build -ldflags="-s -w -X main.toolVersion=${{ needs.check.outputs.version }}" -o "${{ matrix.asset }}" .
+          go build -trimpath -ldflags="-s -w -X main.toolVersion=${{ needs.check.outputs.version }}" -o "${{ matrix.asset }}" .
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
