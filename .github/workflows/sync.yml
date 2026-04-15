@@ -73,13 +73,21 @@ jobs:
           tar -czf opencodeui-dist.tar.gz -C upstream/dist .
           echo "dist.tar.gz created"
 
+      - name: Get upstream release info
+        id: upstream
+        run: |
+          BODY=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/tags/${{ needs.check.outputs.version }} | jq -r '.body // empty')
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "$BODY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
       - name: Create Release
         id: release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.check.outputs.version }}
-          name: Sync ${{ needs.check.outputs.version }}
-          generate_release_notes: true
+          name: Sync ${{ env.UPSTREAM_REPO }} ${{ needs.check.outputs.version }}
+          body: ${{ steps.upstream.outputs.body }}
           files: opencodeui-dist.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
