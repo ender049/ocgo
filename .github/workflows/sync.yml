@@ -59,7 +59,7 @@ jobs:
 
       - name: Build
         working-directory: upstream
-        run: npm run build
+        run: npx vite build
         env:
           VITE_API_BASE_URL: /api
 
