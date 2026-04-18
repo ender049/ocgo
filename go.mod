@@ -1,4 +1,4 @@
-module opencodeui
+module github.com/ender049/ocgo
 
 go 1.21
 

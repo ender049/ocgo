@@ -87,11 +87,12 @@ type preparedToolUpdate struct {
 }
 
 type preparedOpencodeUpdate struct {
-	TargetPath  string
-	ArchivePath string
-	Version     string
-	Existing    bool
-	Skip        bool
+	TargetPath     string
+	ArchivePath    string
+	Version        string
+	CurrentVersion string
+	Existing       bool
+	Skip           bool
 }
 
 var versionCmd = &cobra.Command{
@@ -165,10 +166,16 @@ func runUpdate(_ *cobra.Command, _ []string) error {
 	}
 	stopCheck()
 	toolNeedsUpdate := remote != toolVersion
+	toolAlreadyLatest := false
 	if toolNeedsUpdate {
 		fmt.Printf("ocgo update available: %s -> %s\n", toolVersion, remote)
 	} else {
+		toolAlreadyLatest = true
 		fmt.Printf("ocgo already at latest version: %s\n", toolVersion)
+	}
+	opencodeBinaryForUpdate := ""
+	if runningState != nil {
+		opencodeBinaryForUpdate = strings.TrimSpace(runningState.OpencodeBinary)
 	}
 	opencodeTargetVersion := strings.TrimSpace(updateOCVersion)
 	if opencodeTargetVersion == "" {
@@ -181,6 +188,19 @@ func runUpdate(_ *cobra.Command, _ []string) error {
 		}
 		opencodeTargetVersion = latestOpencode
 	}
+	inspectedOpencode, err := inspectOpencodeUpdate(opencodeBinaryForUpdate, opencodeTargetVersion)
+	if err != nil {
+		return err
+	}
+	opencodeTargetVersion = inspectedOpencode.Version
+	opencodeAlreadyLatest := inspectedOpencode.Skip
+	if opencodeAlreadyLatest {
+		currentVersion := strings.TrimSpace(inspectedOpencode.CurrentVersion)
+		if currentVersion == "" {
+			currentVersion = inspectedOpencode.Version
+		}
+		fmt.Printf("opencode already at latest version: %s\n", currentVersion)
+	}
 	updateTool := toolNeedsUpdate
 	if updateTool {
 		ok, err := confirmYesNo(fmt.Sprintf("Update ocgo to %s? [Y/n]: ", remote))
@@ -192,8 +212,8 @@ func runUpdate(_ *cobra.Command, _ []string) error {
 		fmt.Println("ocgo update skipped: already latest")
 	}
 
-	updateOpencode := true
-	if opencodeTargetVersion != "" {
+	updateOpencode := !opencodeAlreadyLatest
+	if updateOpencode && opencodeTargetVersion != "" {
 		ok, err := confirmYesNo(fmt.Sprintf("Update opencode to %s? [Y/n]: ", opencodeTargetVersion))
 		if err != nil {
 			return err
@@ -202,7 +222,11 @@ func runUpdate(_ *cobra.Command, _ []string) error {
 	}
 
 	if !updateTool && !updateOpencode {
-		fmt.Println("No updates selected")
+		if toolAlreadyLatest && opencodeAlreadyLatest {
+			fmt.Println("No updates to apply")
+		} else {
+			fmt.Println("No updates selected")
+		}
 		return nil
 	}
 
@@ -217,10 +241,10 @@ func runUpdate(_ *cobra.Command, _ []string) error {
 		}
 	}
 
-	if !updateTool {
+	if !updateTool && !toolAlreadyLatest {
 		fmt.Println("ocgo update skipped")
 	}
-	if !updateOpencode {
+	if !updateOpencode && !opencodeAlreadyLatest {
 		fmt.Println("opencode update skipped")
 	}
 
@@ -243,12 +267,8 @@ func runUpdate(_ *cobra.Command, _ []string) error {
 		}
 	}()
 
-	opencodeBinaryForUpdate := ""
-	if runningState != nil {
-		opencodeBinaryForUpdate = strings.TrimSpace(runningState.OpencodeBinary)
-	}
 	if updateOpencode {
-		preparedOpencode, err = prepareOpencodeUpdate(opencodeBinaryForUpdate, opencodeTargetVersion)
+		preparedOpencode, err = prepareInspectedOpencodeUpdate(inspectedOpencode)
 		if err != nil {
 			return err
 		}
@@ -401,7 +421,7 @@ func applyPreparedToolUpdate(update *preparedToolUpdate) error {
 	return nil
 }
 
-func prepareOpencodeUpdate(explicit, targetVersion string) (*preparedOpencodeUpdate, error) {
+func inspectOpencodeUpdate(explicit, targetVersion string) (*preparedOpencodeUpdate, error) {
 	targetVersion = strings.TrimSpace(targetVersion)
 	resolved, _, err := findOpencodeBinary(explicit)
 	existing := err == nil
@@ -428,12 +448,25 @@ func prepareOpencodeUpdate(explicit, targetVersion string) (*preparedOpencodeUpd
 	if targetVersion == "" {
 		return nil, fmt.Errorf("no published opencode release found")
 	}
+	update := &preparedOpencodeUpdate{TargetPath: targetPath, Version: targetVersion, Existing: existing}
 	if existing {
 		currentVersion, err := opencodeBinaryVersion(resolved)
-		if err == nil && sameVersion(currentVersion, targetVersion) {
-			fmt.Printf("opencode already at latest version: %s\n", strings.TrimSpace(currentVersion))
-			return &preparedOpencodeUpdate{TargetPath: targetPath, Version: targetVersion, Existing: true, Skip: true}, nil
+		if err == nil {
+			update.CurrentVersion = strings.TrimSpace(currentVersion)
+			if sameVersion(currentVersion, targetVersion) {
+				update.Skip = true
+			}
 		}
+	}
+	return update, nil
+}
+
+func prepareInspectedOpencodeUpdate(update *preparedOpencodeUpdate) (*preparedOpencodeUpdate, error) {
+	if update == nil {
+		return nil, fmt.Errorf("missing inspected opencode update")
+	}
+	if update.Skip {
+		return update, nil
 	}
 	assetName, err := opencodeAssetName()
 	if err != nil {
@@ -445,11 +478,20 @@ func prepareOpencodeUpdate(explicit, targetVersion string) (*preparedOpencodeUpd
 	}
 	archivePath := archiveFile.Name()
 	_ = archiveFile.Close()
-	if err := downloadReleaseAssetToFileFromRepo(opencodeOwner, opencodeRepo, targetVersion, assetName, archivePath); err != nil {
+	if err := downloadReleaseAssetToFileFromRepo(opencodeOwner, opencodeRepo, update.Version, assetName, archivePath); err != nil {
 		_ = os.Remove(archivePath)
-		return nil, fmt.Errorf("failed to download opencode %s: %w", targetVersion, err)
+		return nil, fmt.Errorf("failed to download opencode %s: %w", update.Version, err)
 	}
-	return &preparedOpencodeUpdate{TargetPath: targetPath, ArchivePath: archivePath, Version: targetVersion, Existing: existing}, nil
+	update.ArchivePath = archivePath
+	return update, nil
+}
+
+func prepareOpencodeUpdate(explicit, targetVersion string) (*preparedOpencodeUpdate, error) {
+	update, err := inspectOpencodeUpdate(explicit, targetVersion)
+	if err != nil {
+		return nil, err
+	}
+	return prepareInspectedOpencodeUpdate(update)
 }
 
 func applyPreparedOpencodeUpdate(update *preparedOpencodeUpdate) (string, error) {

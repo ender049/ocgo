@@ -1,5 +1,9 @@
-opencodeui
 .version
-.opencodeui.pid
-.opencodeui.state.json
-opencodeui-linux-amd64
+
+# Current local runtime/build artifacts
+ocgo
+.ocgo.pid
+.ocgo.state.json
+ocgo.new
+ocgo.bak
+ocgo-linux-amd64
