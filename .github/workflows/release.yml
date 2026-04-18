@@ -112,10 +112,10 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
-            asset: opencodeui-linux-amd64
+            asset: ocgo-linux-amd64
           - goos: linux
             goarch: arm64
-            asset: opencodeui-linux-arm64
+            asset: ocgo-linux-arm64
     steps:
       - uses: actions/checkout@v6
 
@@ -154,7 +154,7 @@ jobs:
       - name: Download all binary artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: opencodeui-*
+          pattern: ocgo-*
           path: release-assets
           merge-multiple: true
 

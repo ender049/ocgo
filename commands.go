@@ -690,7 +690,7 @@ func taggedReleaseInfoURLs(owner, repo, version string) []string {
 }
 
 func toolAssetName() string {
-	name := fmt.Sprintf("opencodeui-%s-%s", runtime.GOOS, runtime.GOARCH)
+	name := fmt.Sprintf("ocgo-%s-%s", runtime.GOOS, runtime.GOARCH)
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}

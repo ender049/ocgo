@@ -18,7 +18,7 @@
 
 ## 使用
 
-下载对应平台的二进制后：
+下载对应平台的二进制（例如 release 中的 `ocgo-linux-amd64`）后：
 
 ```bash
 ./opencodeui start
