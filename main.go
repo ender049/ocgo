@@ -16,6 +16,9 @@ func main() {
 Examples:
 	  ocgo start                  # Start in background and manage opencode
 	  ocgo start --foreground     # Run in foreground
+	  ocgo start --port 443       # Auto-enable HTTPS if ./fullchain.pem and ./privkey.pem exist next to binary
+	  ocgo start --tls-cert /path/fullchain.pem --tls-key /path/privkey.pem
+	                                   # Enable HTTPS with an existing certificate
 	  ocgo start --external       # Use default external backend
 	  ocgo start --backend 127.0.0.1:4096
 	                                   # Use external opencode backend

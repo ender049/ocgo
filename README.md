@@ -23,6 +23,7 @@
 ```bash
 ./ocgo start
 ./ocgo start --foreground
+./ocgo start --tls-cert /etc/letsencrypt/live/example.com/fullchain.pem --tls-key /etc/letsencrypt/live/example.com/privkey.pem
 ./ocgo start --external
 ./ocgo restart
 ./ocgo status
@@ -38,6 +39,7 @@
 - 默认后台运行
 - 默认纳管 `opencode`
 - 默认托管后端地址：`127.0.0.1:4096`
+- 默认会检查二进制同目录下的 `fullchain.pem` 和 `privkey.pem`；两者都存在且有效时自动启用 HTTPS，否则回退到 HTTP
 - 默认情况下 `start` 就等于“后台运行 + 纳管 opencode”
 
 如果你要改成前台运行或使用外部后端：
@@ -46,6 +48,7 @@
 ./ocgo start --foreground
 ./ocgo start --external
 ./ocgo start --backend 127.0.0.1:4096
+./ocgo start --tls-cert /etc/letsencrypt/live/example.com/fullchain.pem --tls-key /etc/letsencrypt/live/example.com/privkey.pem
 ```
 
 说明：
@@ -54,8 +57,11 @@
 - `start --foreground` 适合 `systemd`、`supervisor`、Docker 这类外部进程管理器前台运行
 - `start --external` 表示不纳管 `opencode`，并使用默认外部后端地址
 - `start --backend ...` 表示不纳管 `opencode`，并转发到你指定的外部后端
+- `start --tls-cert ... --tls-key ...` 会显式指定 HTTPS 证书；证书和私钥必须同时提供，且优先级高于自动检测
+- 如果没显式指定证书，会自动检查二进制同目录下的 `fullchain.pem + privkey.pem`；缺失时不会保存 TLS 配置，而是直接按 HTTP 启动
 - 如果本机还没有安装 `opencode`，托管启动时会自动下载对应平台的 CLI release 二进制并安装
 - `restart` 会优先复用当前运行实例的监听参数、后端参数和托管参数，也支持通过 flags 覆盖
+- 外部后端现在既支持 `127.0.0.1:4096`，也支持 `http://127.0.0.1:4096` 或 `https://example.com`
 - `status` 会显示托管的 `opencode` 进程状态
 - `stop` 会同时停止前端服务和它托管的 `opencode`
 - 默认托管地址是 `127.0.0.1:4096`，可用 `--oc-host`、`--oc-port` 调整
@@ -76,10 +82,15 @@
 
 ```bash
 ./ocgo start --host 0.0.0.0 --port 8080
+cp /etc/letsencrypt/live/example.com/fullchain.pem ./fullchain.pem
+cp /etc/letsencrypt/live/example.com/privkey.pem ./privkey.pem
+./ocgo start --host 0.0.0.0 --port 443
+./ocgo start --host 0.0.0.0 --port 443 --tls-cert /etc/letsencrypt/live/example.com/fullchain.pem --tls-key /etc/letsencrypt/live/example.com/privkey.pem
 ./ocgo start --path /srv/my-project
 ./ocgo start --foreground --path /srv/my-project
 ./ocgo start --external
 ./ocgo start --backend 127.0.0.1:4096
+./ocgo start --external --backend https://opencode.example.com
 ./ocgo restart --port 8081
 ./ocgo restart --external
 ./ocgo restart --backend 127.0.0.1:5000

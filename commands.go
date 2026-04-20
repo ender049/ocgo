@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -35,7 +37,8 @@ const (
 	pidFile         = ".ocgo.pid"
 	stateFile       = ".ocgo.state.json"
 	frontendDir     = "dist"
-	shutdownTTL     = 5 * time.Second
+	shutdownTTL     = 15 * time.Second
+	forceKillTTL    = 2 * time.Second
 	opencodeBinName = "opencode"
 )
 
@@ -57,6 +60,9 @@ type serverState struct {
 	PID                int    `json:"pid"`
 	ListenIP           string `json:"listen_ip"`
 	Port               int    `json:"port"`
+	TLSEnabled         bool   `json:"tls_enabled,omitempty"`
+	TLSCertFile        string `json:"tls_cert_file,omitempty"`
+	TLSKeyFile         string `json:"tls_key_file,omitempty"`
 	Backend            string `json:"backend"`
 	ManageOpencode     bool   `json:"manage_opencode,omitempty"`
 	OpencodeBinary     string `json:"opencode_binary,omitempty"`
@@ -70,6 +76,8 @@ type commandRunOptions struct {
 	BackendURL         string
 	ListenIP           string
 	ListenPort         int
+	TLSCertFile        string
+	TLSKeyFile         string
 	Foreground         bool
 	ExternalBackend    bool
 	ManageOpencode     bool
@@ -870,6 +878,8 @@ func configureRuntimeFlags(cmd *cobra.Command, withDefaults bool) {
 	cmd.Flags().String("backend", "", "OpenCode backend URL")
 	cmd.Flags().String("host", defaultIP, "Listen host")
 	cmd.Flags().IntP("port", "p", defaultPort, "Listen port")
+	cmd.Flags().String("tls-cert", "", "TLS certificate file for HTTPS")
+	cmd.Flags().String("tls-key", "", "TLS private key file for HTTPS")
 	cmd.Flags().String("oc-bin", "", "Path to managed opencode binary")
 	cmd.Flags().String("oc-host", defaultOpencodeIP, "Listen host for managed opencode")
 	cmd.Flags().Int("oc-port", defaultOpencodePort, "Listen port for managed opencode")
@@ -905,6 +915,14 @@ func readCommandRunOptions(cmd *cobra.Command, withDefaults bool) (commandRunOpt
 	if err != nil {
 		return options, err
 	}
+	options.TLSCertFile, err = cmd.Flags().GetString("tls-cert")
+	if err != nil {
+		return options, err
+	}
+	options.TLSKeyFile, err = cmd.Flags().GetString("tls-key")
+	if err != nil {
+		return options, err
+	}
 	options.Foreground, _ = cmd.Flags().GetBool("foreground")
 	options.OpencodeBinary, err = cmd.Flags().GetString("oc-bin")
 	if err != nil {
@@ -937,6 +955,8 @@ func buildServerStateFromOptions(options commandRunOptions) (serverState, error)
 	state := serverState{
 		ListenIP:           options.ListenIP,
 		Port:               options.ListenPort,
+		TLSCertFile:        strings.TrimSpace(options.TLSCertFile),
+		TLSKeyFile:         strings.TrimSpace(options.TLSKeyFile),
 		ManageOpencode:     options.ManageOpencode,
 		OpencodeBinary:     strings.TrimSpace(options.OpencodeBinary),
 		OpencodeListenIP:   strings.TrimSpace(options.OpencodeListenIP),
@@ -948,6 +968,18 @@ func buildServerStateFromOptions(options commandRunOptions) (serverState, error)
 	}
 	if state.Port <= 0 {
 		state.Port = defaultListenPort
+	}
+	certFile, keyFile, tlsEnabled, tlsExplicit, err := resolveTLSConfig(state.TLSCertFile, state.TLSKeyFile)
+	if err != nil {
+		return state, err
+	}
+	state.TLSEnabled = tlsEnabled
+	if tlsExplicit {
+		state.TLSCertFile = certFile
+		state.TLSKeyFile = keyFile
+	} else {
+		state.TLSCertFile = ""
+		state.TLSKeyFile = ""
 	}
 
 	if state.ManageOpencode {
@@ -991,7 +1023,129 @@ func buildServerStateFromOptions(options commandRunOptions) (serverState, error)
 			state.Backend = fmt.Sprintf("%s:%d", defaultOpencodeListenIP, defaultOpencodeListenPort)
 		}
 	}
+	if _, _, err := parseBackendTarget(state.Backend); err != nil {
+		return state, err
+	}
 	return state, nil
+}
+
+func resolveTLSConfig(certFile string, keyFile string) (string, string, bool, bool, error) {
+	certFile = strings.TrimSpace(certFile)
+	keyFile = strings.TrimSpace(keyFile)
+	if certFile == "" && keyFile == "" {
+		certFile, keyFile, err := detectDefaultTLSConfig()
+		if err != nil {
+			return "", "", false, false, err
+		}
+		if certFile == "" || keyFile == "" {
+			return "", "", false, false, nil
+		}
+		return certFile, keyFile, true, false, nil
+	}
+	if certFile == "" || keyFile == "" {
+		return "", "", false, false, fmt.Errorf("TLS requires both --tls-cert and --tls-key")
+	}
+	certFile, keyFile, err := validateTLSConfig(certFile, keyFile)
+	if err != nil {
+		return "", "", false, false, err
+	}
+	return certFile, keyFile, true, true, nil
+}
+
+func detectDefaultTLSConfig() (string, string, error) {
+	certFile, keyFile := defaultTLSCandidatePair()
+	if certFile == "" || keyFile == "" {
+		return "", "", nil
+	}
+	certInfo, certErr := os.Stat(certFile)
+	keyInfo, keyErr := os.Stat(keyFile)
+	if certErr != nil || keyErr != nil {
+		return "", "", nil
+	}
+	if certInfo.IsDir() || keyInfo.IsDir() {
+		return "", "", nil
+	}
+	return validateTLSConfig(certFile, keyFile)
+}
+
+func defaultTLSCandidatePair() (string, string) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", ""
+	}
+	exeDir := filepath.Dir(exePath)
+	return filepath.Join(exeDir, "fullchain.pem"), filepath.Join(exeDir, "privkey.pem")
+}
+
+func isDefaultTLSPathPair(certFile string, keyFile string) bool {
+	certFile = strings.TrimSpace(certFile)
+	keyFile = strings.TrimSpace(keyFile)
+	if certFile == "" || keyFile == "" {
+		return false
+	}
+	defaultCertFile, defaultKeyFile := defaultTLSCandidatePair()
+	return certFile == defaultCertFile && keyFile == defaultKeyFile
+}
+
+func validateTLSConfig(certFile string, keyFile string) (string, string, error) {
+	certFile = expandUserPath(certFile)
+	keyFile = expandUserPath(keyFile)
+	if !filepath.IsAbs(certFile) {
+		absCert, err := filepath.Abs(certFile)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to resolve TLS cert path %s: %w", certFile, err)
+		}
+		certFile = absCert
+	}
+	if !filepath.IsAbs(keyFile) {
+		absKey, err := filepath.Abs(keyFile)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to resolve TLS key path %s: %w", keyFile, err)
+		}
+		keyFile = absKey
+	}
+	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+		return "", "", fmt.Errorf("invalid TLS certificate or key: %w", err)
+	}
+	return certFile, keyFile, nil
+}
+
+func expandUserPath(pathValue string) string {
+	pathValue = strings.TrimSpace(pathValue)
+	if strings.HasPrefix(pathValue, "~/") {
+		homeDir, _ := os.UserHomeDir()
+		if homeDir != "" {
+			return filepath.Join(homeDir, strings.TrimPrefix(pathValue, "~/"))
+		}
+	}
+	return pathValue
+}
+
+func parseBackendTarget(raw string) (string, string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", fmt.Errorf("missing backend address")
+	}
+	if !strings.Contains(raw, "://") {
+		return "http", raw, nil
+	}
+	target, err := url.Parse(raw)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid backend %q: %w", raw, err)
+	}
+	if target.Host == "" {
+		return "", "", fmt.Errorf("invalid backend %q: missing host", raw)
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return "", "", fmt.Errorf("invalid backend %q: unsupported scheme %q", raw, target.Scheme)
+	}
+	if target.Path != "" && target.Path != "/" {
+		return "", "", fmt.Errorf("invalid backend %q: base path is not supported", raw)
+	}
+	if target.RawQuery != "" || target.Fragment != "" {
+		return "", "", fmt.Errorf("invalid backend %q: query and fragment are not supported", raw)
+	}
+	return target.Scheme, target.Host, nil
 }
 
 func resolveOpencodeBinary(binary string) (string, error) {
@@ -1219,13 +1373,13 @@ func sameVersion(left, right string) bool {
 }
 
 func stopTrackedServer(state serverState, pid int) error {
-	if pid > 0 && isProcessRunning(pid) {
-		if err := stopProcess(pid); err != nil {
+	if state.OpencodePID > 0 && isProcessRunning(state.OpencodePID) {
+		if err := stopProcess(state.OpencodePID); err != nil {
 			return err
 		}
 	}
-	if state.OpencodePID > 0 && isProcessRunning(state.OpencodePID) {
-		if err := stopProcess(state.OpencodePID); err != nil {
+	if pid > 0 && isProcessRunning(pid) {
+		if err := stopProcess(pid); err != nil {
 			return err
 		}
 	}
@@ -1258,6 +1412,10 @@ func startDetached(selfPath string, state *serverState) (int, error) {
 	if state == nil {
 		return 0, fmt.Errorf("missing server state")
 	}
+	if isDefaultTLSPathPair(state.TLSCertFile, state.TLSKeyFile) {
+		state.TLSCertFile = ""
+		state.TLSKeyFile = ""
+	}
 	if err := ensureListenAddressAvailable(state.ListenIP, state.Port); err != nil {
 		return 0, err
 	}
@@ -1282,6 +1440,12 @@ func startDetached(selfPath string, state *serverState) (int, error) {
 		"--host", state.ListenIP,
 		"--port", fmt.Sprintf("%d", state.Port),
 	)
+	if state.TLSCertFile != "" && state.TLSKeyFile != "" {
+		cmd.Args = append(cmd.Args,
+			"--tls-cert", state.TLSCertFile,
+			"--tls-key", state.TLSKeyFile,
+		)
+	}
 	if state.ManageOpencode {
 		cmd.Args = append(cmd.Args,
 			"--oc-bin", state.OpencodeBinary,
@@ -1332,15 +1496,9 @@ func runStop(_ *cobra.Command, _ []string) error {
 		fmt.Println("Server not running (stale pid file)")
 		return nil
 	}
-	if err := stopProcess(pid); err != nil {
+	if err := stopTrackedServer(state, pid); err != nil {
 		return fmt.Errorf("failed to stop: %w", err)
 	}
-	if state.OpencodePID > 0 && isProcessRunning(state.OpencodePID) {
-		if err := stopProcess(state.OpencodePID); err != nil {
-			return fmt.Errorf("server stopped but managed opencode is still running: %w", err)
-		}
-	}
-	removeStateFiles()
 	fmt.Println("Server stopped")
 	return nil
 }
@@ -1363,15 +1521,9 @@ func runRestart(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	if err := stopProcess(currentPID); err != nil {
+	if err := stopTrackedServer(currentState, currentPID); err != nil {
 		return fmt.Errorf("failed to stop current server: %w", err)
 	}
-	if currentState.OpencodePID > 0 && isProcessRunning(currentState.OpencodePID) {
-		if err := stopProcess(currentState.OpencodePID); err != nil {
-			return fmt.Errorf("server stopped but managed opencode is still running: %w", err)
-		}
-	}
-	removeStateFiles()
 
 	selfPath, err := os.Executable()
 	if err != nil {
@@ -1413,7 +1565,14 @@ func printServerSummary(title string, pid int, state serverState) {
 	if pid > 0 {
 		fmt.Printf("  PID:      %d\n", pid)
 	}
-	fmt.Printf("  Listen:   %s:%d\n", state.ListenIP, state.Port)
+	fmt.Printf("  Listen:   %s://%s:%d\n", serverScheme(state), state.ListenIP, state.Port)
+	if tlsEnabled(state) {
+		if state.TLSCertFile != "" {
+			fmt.Printf("  TLS:      enabled (%s)\n", state.TLSCertFile)
+		} else {
+			fmt.Println("  TLS:      enabled (auto: ./fullchain.pem + ./privkey.pem)")
+		}
+	}
 	if state.ManageOpencode {
 		fmt.Printf("  OpenCode: managed on %s:%d\n", state.OpencodeListenIP, state.OpencodePort)
 		if strings.TrimSpace(state.OpencodeProjectDir) != "" {
@@ -1472,12 +1631,34 @@ func restartTargetState(current serverState, options commandRunOptions) (serverS
 	if strings.TrimSpace(options.OpencodeProjectDir) != "" {
 		state.OpencodeProjectDir = strings.TrimSpace(options.OpencodeProjectDir)
 	}
+	if strings.TrimSpace(options.TLSCertFile) != "" {
+		state.TLSCertFile = strings.TrimSpace(options.TLSCertFile)
+	}
+	if strings.TrimSpace(options.TLSKeyFile) != "" {
+		state.TLSKeyFile = strings.TrimSpace(options.TLSKeyFile)
+	}
 
 	if state.ListenIP == "" {
 		state.ListenIP = defaultListenIP
 	}
 	if state.Port == 0 {
 		state.Port = defaultListenPort
+	}
+	if strings.TrimSpace(options.TLSCertFile) == "" && strings.TrimSpace(options.TLSKeyFile) == "" && isDefaultTLSPathPair(state.TLSCertFile, state.TLSKeyFile) {
+		state.TLSCertFile = ""
+		state.TLSKeyFile = ""
+	}
+	certFile, keyFile, tlsEnabled, tlsExplicit, err := resolveTLSConfig(state.TLSCertFile, state.TLSKeyFile)
+	if err != nil {
+		return state, err
+	}
+	state.TLSEnabled = tlsEnabled
+	if tlsExplicit {
+		state.TLSCertFile = certFile
+		state.TLSKeyFile = keyFile
+	} else {
+		state.TLSCertFile = ""
+		state.TLSKeyFile = ""
 	}
 
 	if state.ManageOpencode {
@@ -1500,11 +1681,27 @@ func restartTargetState(current serverState, options commandRunOptions) (serverS
 			return state, fmt.Errorf("managed opencode requires backend %s, got %s", managedBackend, state.Backend)
 		}
 		state.Backend = managedBackend
+	} else if _, _, err := parseBackendTarget(state.Backend); err != nil {
+		return state, err
 	}
 
 	state.PID = 0
 	state.OpencodePID = 0
 	return state, nil
+}
+
+func serverScheme(state serverState) string {
+	if tlsEnabled(state) {
+		return "https"
+	}
+	return "http"
+}
+
+func tlsEnabled(state serverState) bool {
+	if state.TLSEnabled {
+		return true
+	}
+	return strings.TrimSpace(state.TLSCertFile) != "" && strings.TrimSpace(state.TLSKeyFile) != ""
 }
 
 func runStatus(_ *cobra.Command, _ []string) error {
@@ -1522,7 +1719,14 @@ func runStatus(_ *cobra.Command, _ []string) error {
 	fmt.Printf("Running (PID %d)\n", pid)
 	state, err := readState()
 	if err == nil {
-		fmt.Printf("Listen:  %s:%d\n", state.ListenIP, state.Port)
+		fmt.Printf("Listen:  %s://%s:%d\n", serverScheme(state), state.ListenIP, state.Port)
+		if tlsEnabled(state) {
+			if state.TLSCertFile != "" {
+				fmt.Printf("TLS:     enabled (%s)\n", state.TLSCertFile)
+			} else {
+				fmt.Println("TLS:     enabled (auto: ./fullchain.pem + ./privkey.pem)")
+			}
+		}
 		if state.ManageOpencode {
 			status := "managed"
 			if state.OpencodePID > 0 && isProcessRunning(state.OpencodePID) {
@@ -1592,23 +1796,63 @@ func isProcessRunning(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	return syscall.Kill(pid, 0) == nil
+	if err := syscall.Kill(pid, 0); err != nil {
+		return false
+	}
+	state, err := processState(pid)
+	if err == nil && state == 'Z' {
+		return false
+	}
+	return true
 }
 
 func stopProcess(pid int) error {
+	if pid <= 0 {
+		return nil
+	}
 	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
 		return err
 	}
+	if waitForProcessExit(pid, shutdownTTL) {
+		return nil
+	}
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return fmt.Errorf("process %d did not exit after SIGTERM and SIGKILL failed: %w", pid, err)
+	}
+	if waitForProcessExit(pid, forceKillTTL) {
+		return nil
+	}
+	return fmt.Errorf("process %d did not exit after SIGTERM and SIGKILL", pid)
+}
 
-	deadline := time.Now().Add(shutdownTTL)
+func waitForProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if !isProcessRunning(pid) {
-			return nil
+			return true
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+	return !isProcessRunning(pid)
+}
 
-	return fmt.Errorf("process %d did not exit in time", pid)
+func processState(pid int) (byte, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	stat := string(data)
+	idx := strings.LastIndex(stat, ")")
+	if idx == -1 || idx+2 >= len(stat) {
+		return 0, fmt.Errorf("unexpected /proc stat format for pid %d", pid)
+	}
+	return stat[idx+2], nil
 }
 
 func startManagedOpencode(state *serverState) (*exec.Cmd, error) {
@@ -1673,6 +1917,18 @@ func runServeWithOptions(options commandRunOptions) error {
 	if err != nil {
 		return err
 	}
+	runtimeTLSCertFile, runtimeTLSKeyFile, runtimeTLSEnabled, runtimeTLSExplicit, err := resolveTLSConfig(state.TLSCertFile, state.TLSKeyFile)
+	if err != nil {
+		return err
+	}
+	state.TLSEnabled = runtimeTLSEnabled
+	if runtimeTLSExplicit {
+		state.TLSCertFile = runtimeTLSCertFile
+		state.TLSKeyFile = runtimeTLSKeyFile
+	} else {
+		state.TLSCertFile = ""
+		state.TLSKeyFile = ""
+	}
 	if err := ensureListenAddressAvailable(state.ListenIP, state.Port); err != nil {
 		return err
 	}
@@ -1683,6 +1939,10 @@ func runServeWithOptions(options commandRunOptions) error {
 	}
 
 	addr := fmt.Sprintf("%s:%d", state.ListenIP, state.Port)
+	backendScheme, backendHost, err := parseBackendTarget(state.Backend)
+	if err != nil {
+		return err
+	}
 
 	frontendFS, err := fs.Sub(embeddedFrontend, frontendDir)
 	if err != nil {
@@ -1692,8 +1952,8 @@ func runServeWithOptions(options commandRunOptions) error {
 	fileServer := http.FileServer(http.FS(frontendFS))
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
-			req.URL.Scheme = "http"
-			req.URL.Host = state.Backend
+			req.URL.Scheme = backendScheme
+			req.URL.Host = backendHost
 			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/api")
 		},
 		Transport: http.DefaultTransport,
@@ -1757,6 +2017,10 @@ func runServeWithOptions(options commandRunOptions) error {
 	server := &http.Server{Addr: addr, Handler: mux}
 	serverErrCh := make(chan error, 1)
 	go func() {
+		if runtimeTLSEnabled {
+			serverErrCh <- server.ListenAndServeTLS(runtimeTLSCertFile, runtimeTLSKeyFile)
+			return
+		}
 		serverErrCh <- server.ListenAndServe()
 	}()
 
